@@ -1,6 +1,6 @@
 // LLM proposer (Gemini first, with fallbacks). The model only returns code text; it never runs anything and never sees held-out cases.
 import type { FamilySpec } from "./bench/cases";
-import { completeJSON } from "./llm";
+import { completeJSON, type Completer } from "./llm";
 
 export interface Failure {
   input: string;
@@ -32,6 +32,8 @@ export async function propose(opts: {
   currentCode: string;
   failures: Failure[];
   priorAttempt?: { code: string; rejectedBecause: string[] };
+  /** Who answers. Default: Forge's own providers. A round started by the Veloce host passes the host's model call (veloceModel.ts). */
+  complete?: Completer;
 }): Promise<Proposal> {
   const parts = [
     `Role: ${opts.spec.agentRole}`,
@@ -46,8 +48,8 @@ export async function propose(opts: {
   }
   parts.push("Return JSON with keys rationale (one or two sentences) and code (the complete Python module).");
 
-  // Ordered fallback across Gemini, OpenRouter, NVIDIA NIM and GitHub Models (see llm.ts).
-  const { completion, json } = await completeJSON(SYSTEM, parts.join("\n\n"));
+  // Ordered fallback across Forge's own providers (see llm.ts), unless the caller supplied the model call.
+  const { completion, json } = await (opts.complete ?? completeJSON)(SYSTEM, parts.join("\n\n"));
   return {
     rationale: json.rationale ?? "",
     code: json.code!,

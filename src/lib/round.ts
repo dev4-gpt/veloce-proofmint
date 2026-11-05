@@ -5,6 +5,7 @@ import { SCORERS } from "./bench/scorers";
 import { loadHeldout } from "./heldout";
 import { allowedImports, type CrossCheck, decideGate, egressBlocked, feedbackSafeReasons, type GateDecision, type RunnerOutput, scoreOutputs, staticScreen } from "./gate";
 import { type Failure, propose } from "./gemini";
+import type { Completer } from "./llm";
 import { AST_SCREEN_PY, PIPELINE_PY, RUNNER_PY } from "./sandbox/runnerSource";
 import { createSandboxReaping, destroySandbox, exec, upload } from "./sandbox/client";
 
@@ -77,6 +78,7 @@ export async function runRound(opts: {
   maxAttempts?: number;
   partner?: { family: Family; code: string }; // the CURRENT active tool of the partner pillar (required for command/govern)
   scripted?: { code: string; rationale: string }; // demo-only: a fixed candidate instead of calling the model
+  complete?: Completer; // who answers the proposer; default Forge's own providers (the Veloce host passes its model call)
   emit?: (e: RoundEvent) => void;
 }): Promise<RoundResult> {
   const emit = opts.emit ?? (() => {});
@@ -152,7 +154,7 @@ export async function runRound(opts: {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const p = opts.scripted
         ? { rationale: opts.scripted.rationale, code: opts.scripted.code, tokensIn: 0, tokensOut: 0, model: "scripted-demo" }
-        : await propose({ spec, currentCode: opts.currentCode, failures, priorAttempt: prior });
+        : await propose({ spec, currentCode: opts.currentCode, failures, priorAttempt: prior, complete: opts.complete });
       if (p.tokensIn === null || p.tokensOut === null || usage.tokensIn === null || usage.tokensOut === null) {
         usage.tokensIn = null;
         usage.tokensOut = null;
