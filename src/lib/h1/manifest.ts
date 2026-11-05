@@ -1,14 +1,14 @@
 // Veloce ProofMint (this repo, formerly Veloce Forge) as a Veloce adapter (h1 contract, Veloce ADR-005): what it offers and the settings it needs. OFF unless
 // FORGE_H1_ENABLED is exactly "true"; any setting that is present but wrong is refused, never guessed.
 //
-// One task, `forge.round`, draft class: it proposes a better tool version; promotion still needs Forge's own hash-bound human
+// One task, `proofmint.round`, draft class: it proposes a better tool version; promotion still needs Forge's own hash-bound human
 // approval, so nothing here can publish. Deletion guarantee "none": Forge keeps no host memory and offers no deletion receipts,
 // which keeps it out of a client edition until it does (Veloce ADR-014).
 import { createPublicKey, type KeyObject } from "node:crypto";
 import { isHostProvider, validHostUrl, validModelName, type HostProvider } from "../veloceModel";
 
 export const H1_ADAPTER_ID = "veloce-proofmint";
-export const FORGE_TASK = "forge.round";
+export const FORGE_TASK = "proofmint.round";
 export const MAX_HOST_KEYS = 3; // current, next and retiring while a key is rotated (Veloce ADR-012)
 const TENANT_SLUG = /^[a-z][a-z0-9-]{2,40}$/;
 

@@ -186,7 +186,7 @@ export async function executeRound(input: RoundJobInput): Promise<RoundOutcome> 
   }
 }
 
-/** A round the Veloce host started (h1 `forge.round`): paid from Forge's wallet for sandbox time and the fee only. */
+/** A round the Veloce host started (h1 `proofmint.round`): paid from Forge's wallet for sandbox time and the fee only. */
 export async function runHostRound(job: { roundId: string; family: Family; complete: Completer; runRoundImpl?: typeof runRound }): Promise<RoundOutcome> {
   return executeRound({
     roundId: job.roundId, family: job.family, startedBy: "veloce-host", payer: walletPayer(job.roundId, ROUND_CAP_MICROS),

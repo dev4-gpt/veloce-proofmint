@@ -1,5 +1,5 @@
 // Forge's Veloce h1 surface (Veloce ADR-005, ADR-020): manifest, health, task.run, task.get, task.result, task.cancel, events.
-// Every operation needs a single-use host token; every refusal is a short code. The host starts a `forge.round` task with a model
+// Every operation needs a single-use host token; every refusal is a short code. The host starts a `proofmint.round` task with a model
 // grant; the round then runs after the reply (Vercel `after()`), and every model answer comes from the host with that grant
 // (veloceModel.ts). The grant stays in memory: it is never written to the database. A round still running after the function
 // limit is recorded as failed (`timed_out`), so the host's feed always ends with a final state.

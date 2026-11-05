@@ -127,7 +127,7 @@ test("the manifest follows the host's h1 rules: draft only, no deletion receipts
   assert.equal(new Set(MANIFEST.operations).size, MANIFEST.operations.length);
   assert.equal(MANIFEST.deletionGuarantee, "none");
   assert.equal(MANIFEST.sideEffectCeiling, "draft");
-  assert.deepEqual(MANIFEST.tasks, [{ name: "forge.round", sideEffect: "draft" }]);
+  assert.deepEqual(MANIFEST.tasks, [{ name: "proofmint.round", sideEffect: "draft" }]);
   assert.match(FORGE_TASK, /^[a-z][a-z0-9._-]{1,63}$/);
 });
 
