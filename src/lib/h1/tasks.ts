@@ -5,6 +5,7 @@
 // limit is recorded as failed (`timed_out`), so the host's feed always ends with a final state.
 import { createHash, randomUUID } from "node:crypto";
 import { FAMILIES, type Family } from "../bench/cases";
+import { ROUND_CAP_MICROS } from "../cost";
 import { ensureSchema, sql, tryStartRound } from "../db";
 import type { Completer } from "../llm";
 import type { RoundOutcome } from "../roundJob";
@@ -64,6 +65,14 @@ interface TaskRow {
   error: string | null;
   created_at: unknown;
   finished_at: unknown;
+  spent_micros: unknown;
+}
+
+/** What a finished round charged the wallet, for the host to settle the budget it set aside. Nothing charged on a refused
+ *  payment; a cost that is unknown (held, blocked, lost or timed out) is reported as the full cap, never as zero. */
+function spentOf(outcome: RoundOutcome | null): number {
+  if (outcome?.status === "refused") return 0;
+  return outcome?.costMicros ?? ROUND_CAP_MICROS;
 }
 
 function view(row: TaskRow) {
@@ -75,6 +84,7 @@ function view(row: TaskRow) {
     createdAt: iso(row.created_at),
     ...(row.finished_at ? { finishedAt: iso(row.finished_at) } : {}),
     ...(row.error ? { error: row.error } : {}),
+    ...(row.spent_micros === null || row.spent_micros === undefined ? {} : { spentMicros: Number(row.spent_micros) }),
   };
 }
 
@@ -85,7 +95,7 @@ async function appendFinal(row: TaskRow): Promise<void> {
 
 /** Tasks past the function limit become failed (timed_out), once, each with its final event. */
 async function sweepStale(): Promise<void> {
-  const rows = (await sql()`update h1_tasks set state = 'failed', error = 'timed_out', finished_at = now() where state = 'running' and created_at < now() - (${STALE_SECONDS}::int * interval '1 second') returning *`) as TaskRow[];
+  const rows = (await sql()`update h1_tasks set state = 'failed', error = 'timed_out', spent_micros = ${ROUND_CAP_MICROS}, finished_at = now() where state = 'running' and created_at < now() - (${STALE_SECONDS}::int * interval '1 second') returning *`) as TaskRow[];
   for (const row of rows) await appendFinal(row);
 }
 
@@ -95,8 +105,8 @@ async function getTask(taskId: string): Promise<TaskRow | null> {
 }
 
 /** Compare-and-set from running: a task already recorded as failed (timed out) is never overwritten. */
-async function finishTask(taskId: string, state: "succeeded" | "failed", result: Json | null, error: string | null): Promise<void> {
-  const rows = (await sql()`update h1_tasks set state = ${state}, result_json = ${result ? JSON.stringify(result) : null}, error = ${error}, finished_at = now() where task_id = ${taskId} and state = 'running' returning *`) as TaskRow[];
+async function finishTask(taskId: string, state: "succeeded" | "failed", result: Json | null, error: string | null, spent: number): Promise<void> {
+  const rows = (await sql()`update h1_tasks set state = ${state}, result_json = ${result ? JSON.stringify(result) : null}, error = ${error}, spent_micros = ${spent}, finished_at = now() where task_id = ${taskId} and state = 'running' returning *`) as TaskRow[];
   if (rows[0]) await appendFinal(rows[0]);
 }
 
@@ -114,10 +124,10 @@ async function runTask(taskId: string, roundId: string, family: Family, complete
       verdict: outcome.status, needsApproval: outcome.status === "proposed", toolId: outcome.toolId, candidateSha: outcome.candidateSha,
       code: outcome.code, costMicros: outcome.costMicros, visible: outcome.visible, heldout: outcome.heldout,
     };
-    return finishTask(taskId, "succeeded", result, null);
+    return finishTask(taskId, "succeeded", result, null, spentOf(outcome));
   }
   const error = outcome && FAILED_CODES.has(outcome.status) ? outcome.status : "round_error";
-  return finishTask(taskId, "failed", null, error);
+  return finishTask(taskId, "failed", null, error, spentOf(outcome));
 }
 
 async function readJson(req: Request): Promise<{ tooLarge: true } | { json: unknown }> {
@@ -148,6 +158,7 @@ async function taskRun(body: unknown, deps: H1Deps): Promise<Response> {
   if (typeof key !== "string" || !IDEMPOTENCY_KEY.test(key)) return fail(400, "invalid_input");
   const micros = body.budgetMaxMicros;
   if (typeof micros !== "number" || !Number.isSafeInteger(micros) || micros < 1) return fail(400, "invalid_input");
+  if (micros < ROUND_CAP_MICROS) return fail(400, "budget_too_low"); // the host set aside less than one round can cost
   const input = body.input;
   if (!isObject(input) || !onlyKeys(input, ["family"]) || typeof input.family !== "string" || !Object.hasOwn(FAMILIES, input.family)) return fail(400, "invalid_input");
   const family = input.family as Family;

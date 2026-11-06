@@ -59,6 +59,8 @@ export async function ensureSchema() {
   await q`create table if not exists h1_tasks (task_id text primary key, idem_key text not null unique, request_sha text not null, family text not null, round_id text not null, state text not null check (state in ('running','succeeded','failed','cancelled')), result_json text, error text, created_at timestamptz not null default now(), finished_at timestamptz)`;
   await q`create table if not exists h1_events (seq bigserial primary key, id text not null unique, kind text not null, task_id text not null, data_json text not null, at timestamptz not null default now())`;
   await q`create table if not exists h1_used_tokens (jti text primary key, exp bigint not null)`;
+  // What a finished h1 task charged Forge's wallet, reported to the host so it can settle the budget it set aside (Veloce ADR-020).
+  await q`alter table h1_tasks add column if not exists spent_micros bigint`;
   await q`create table if not exists card_holds (round_id text primary key, payment_intent text unique, amount_cents int not null, status text not null check (status in ('authorizing','authorized','capturing','captured','releasing','released','failed','unresolved')), captured_cents int, note text, created_at timestamptz not null default now(), updated_at timestamptz not null default now())`;
   schemaReady = true;
 }

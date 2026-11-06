@@ -261,6 +261,7 @@ test("task.run refuses anything but the exact request, and never starts a round 
     [runBody({ budgetMaxMicros: 0 }), 400, "invalid_input"],
     [runBody({ budgetMaxMicros: 1.5 }), 400, "invalid_input"],
     [runBody({ budgetMaxMicros: "5" }), 400, "invalid_input"],
+    [runBody({ budgetMaxMicros: 249_999 }), 400, "budget_too_low"], // the host set aside less than one round can cost
     [runBody({ input: { family: "nope" } }), 400, "invalid_input"],
     [runBody({ input: { family: "dates", cheat: true } }), 400, "invalid_input"],
     [runBody({ input: "dates" }), 400, "invalid_input"],
@@ -288,6 +289,9 @@ test("task.run refuses anything but the exact request, and never starts a round 
 
 test("the same key and request replays the task; the same key with another request is a conflict", async () => {
   const h = harness();
+  const atCap = harness();
+  assert.equal((await atCap.call("task.run", { body: runBody({ idempotencyKey: "host-task-at-cap", budgetMaxMicros: 250_000 }) })).status, 202);
+  await pg.exec("update rounds set status = 'proposed'");
   const first = await h.call("task.run", { body: runBody() });
   const again = await h.call("task.run", { body: runBody() });
   assert.equal(again.status, 200);
@@ -341,7 +345,8 @@ test("a finished round becomes a succeeded task with a result and exactly one fi
   assert.equal(e.kind, "task.state");
   assert.equal(e.taskId, id);
   assert.equal(e.data.state, "succeeded");
-  assert.ok(!("spentMicros" in e.data)); // the host's ledger holds the model cost; Forge does not report it
+  assert.equal(e.data.spentMicros, 20_010); // what the wallet was charged (sandbox and fee); the host settles its reservation with it
+  assert.equal(done.body.spentMicros, 20_010);
   assert.match(e.id, /^[0-9a-f]{32}$/);
   assert.equal(typeof e.seq, "number");
   assert.equal(page.body.next, e.seq);
@@ -351,12 +356,14 @@ test("a finished round becomes a succeeded task with a result and exactly one fi
 });
 
 test("a round that ends without a verdict, or throws, is a failed task with a short code and frees the round slot", async () => {
-  for (const [run, error] of [
-    [async () => ({ status: "blocked_unsettled", toolId: null, candidateSha: null, code: null, costMicros: null, visible: null, heldout: null }), "blocked_unsettled"],
-    [async () => ({ status: "refused", toolId: null, candidateSha: null, code: null, costMicros: null, visible: null, heldout: null }), "refused"],
-    [async () => ({ status: "error", toolId: null, candidateSha: null, code: null, costMicros: null, visible: null, heldout: null }), "round_error"],
-    [async () => { throw new Error("secret detail that must not leak"); }, "round_error"],
-  ] as [RoundRunner, string][]) {
+  // spentMicros: refused = nothing charged; released before any sandbox = 0; a held, unknown or lost cost = the full cap (never zero)
+  for (const [run, error, spent] of [
+    [async () => ({ status: "blocked_unsettled", toolId: null, candidateSha: null, code: null, costMicros: null, visible: null, heldout: null }), "blocked_unsettled", 250_000],
+    [async () => ({ status: "refused", toolId: null, candidateSha: null, code: null, costMicros: null, visible: null, heldout: null }), "refused", 0],
+    [async () => ({ status: "error", toolId: null, candidateSha: null, code: null, costMicros: null, visible: null, heldout: null }), "round_error", 250_000],
+    [async () => ({ status: "error", toolId: null, candidateSha: null, code: null, costMicros: 0, visible: null, heldout: null }), "round_error", 0],
+    [async () => { throw new Error("secret detail that must not leak"); }, "round_error", 250_000],
+  ] as [RoundRunner, string, number][]) {
     await pg.exec("drop schema public cascade; create schema public;");
     __setSqlForTests(tag);
     await ensureSchema();
@@ -370,6 +377,7 @@ test("a round that ends without a verdict, or throws, is a failed task with a sh
     const page = await h.call("events");
     assert.equal(page.body.events.length, 1);
     assert.equal(page.body.events[0].data.state, "failed");
+    assert.equal(page.body.events[0].data.spentMicros, spent, error);
     assert.deepEqual(await h.call("task.result", { query: `?id=${body.taskId}` }), { status: 409, body: { ok: false, error: "not_ready" } });
     assert.equal(await count("rounds", "status = 'running'"), 0);
   }
@@ -382,6 +390,7 @@ test("a task still running after the function limit reads as failed (timed_out),
   const got = await h.call("task.get", { query: `?id=${body.taskId}` });
   assert.equal(got.body.state, "failed");
   assert.equal(got.body.error, "timed_out");
+  assert.equal(got.body.spentMicros, 250_000); // the round's cost is not known, so the full cap is reported
   await h.call("task.get", { query: `?id=${body.taskId}` });
   assert.equal((await h.call("events")).body.events.length, 1);
   // a round finishing after that cannot overwrite the recorded failure
