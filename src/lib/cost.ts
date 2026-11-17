@@ -9,10 +9,11 @@ export const RATES = {
 export const ROUND_CAP_MICROS = 250_000; // reserved before any sandbox exists: $0.25
 export const TOPUP_CENTS = 500; // $5.00 test-mode top-up
 
-export function priceMicros(u: { tokensIn: number; tokensOut: number; execMs: number }): number {
-  return Math.ceil(
-    u.tokensIn * RATES.inMicrosPerToken + u.tokensOut * RATES.outMicrosPerToken + u.execMs * RATES.execMicrosPerMs + RATES.feeMicros,
-  );
+/** `modelsPaidByHost`: a round started by the Veloce host (ADR-020) has its model calls reserved and settled in the HOST's
+ *  ledger, so Forge charges only the sandbox time and the fee; pricing the tokens here as well would charge them twice. */
+export function priceMicros(u: { tokensIn: number; tokensOut: number; execMs: number }, opts: { modelsPaidByHost?: boolean } = {}): number {
+  const tokens = opts.modelsPaidByHost ? 0 : u.tokensIn * RATES.inMicrosPerToken + u.tokensOut * RATES.outMicrosPerToken;
+  return Math.ceil(tokens + u.execMs * RATES.execMicrosPerMs + RATES.feeMicros);
 }
 
 export const usd = (micros: number) => `$${(micros / 1_000_000).toFixed(3)}`;

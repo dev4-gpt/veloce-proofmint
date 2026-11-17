@@ -54,6 +54,15 @@ export async function ensureSchema() {
   await q`create table if not exists audits (tool_id text not null, set_sha text not null, family text not null, status text not null check (status in ('passed','failed')), cand_pass_json text not null, prev_tool_id text not null, prev_pass_json text not null, heldout_pass int not null, heldout_total int not null, reasons_json text not null, sandbox_id text, cost_micros bigint, created_at timestamptz not null default now(), primary key (tool_id, set_sha))`;
   await q`do $d$ begin if not exists (select 1 from pg_trigger where tgname = 'audits_no_change') then create trigger audits_no_change before update or delete on audits for each row execute function report_chain_immutable(); end if; end $d$`;
   // Stripe manual-capture holds (test mode), one per round paid by card. Every state change is a compare-and-set in cardHold.ts.
+  // Veloce h1 surface (see h1/): tasks the host started (keyed by its idempotency key; the model grant is never stored), their
+  // final-state feed, and the host-token ids already used (kept until they expire, so a token works once).
+  await q`create table if not exists h1_tasks (task_id text primary key, idem_key text not null unique, request_sha text not null, family text not null, round_id text not null, state text not null check (state in ('running','succeeded','failed','cancelled')), result_json text, error text, created_at timestamptz not null default now(), finished_at timestamptz)`;
+  await q`create table if not exists h1_events (seq bigserial primary key, id text not null unique, kind text not null, task_id text not null, data_json text not null, at timestamptz not null default now())`;
+  await q`create table if not exists h1_used_tokens (jti text primary key, exp bigint not null)`;
+  // What a finished h1 task charged Forge's wallet, reported to the host so it can settle the budget it set aside (Veloce ADR-020).
+  await q`alter table h1_tasks add column if not exists spent_micros bigint`;
+  // The host asked this task to stop (task.cancel). The round reads it at its checkpoints; it is never a state by itself.
+  await q`alter table h1_tasks add column if not exists cancel_requested_at timestamptz`;
   await q`create table if not exists card_holds (round_id text primary key, payment_intent text unique, amount_cents int not null, status text not null check (status in ('authorizing','authorized','capturing','captured','releasing','released','failed','unresolved')), captured_cents int, note text, created_at timestamptz not null default now(), updated_at timestamptz not null default now())`;
   schemaReady = true;
 }

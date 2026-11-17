@@ -256,7 +256,10 @@ async function viaOpenAICompat(c: OpenAICompat, system: string, user: string, ti
   };
 }
 
-function extractJson(text: string): string {
+/** What a round's proposer calls for one model answer: Forge's own providers (completeJSON) or the Veloce host (veloceModel.ts). */
+export type Completer = (system: string, user: string) => Promise<{ completion: Completion; json: { rationale?: string; code?: string }; tried: string[] }>;
+
+export function extractJson(text: string): string {
   const t = text.trim();
   const fenced = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
   return fenced ? fenced[1] : t;

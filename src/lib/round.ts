@@ -5,10 +5,20 @@ import { SCORERS } from "./bench/scorers";
 import { loadHeldout } from "./heldout";
 import { allowedImports, type CrossCheck, decideGate, egressBlocked, feedbackSafeReasons, type GateDecision, type RunnerOutput, scoreOutputs, staticScreen } from "./gate";
 import { type Failure, propose } from "./gemini";
+import type { Completer } from "./llm";
 import { AST_SCREEN_PY, PIPELINE_PY, RUNNER_PY } from "./sandbox/runnerSource";
 import { createSandboxReaping, destroySandbox, exec, upload } from "./sandbox/client";
 
 export type RoundEvent = { type: string; [k: string]: unknown };
+
+/** Thrown at a checkpoint when the caller asked the round to stop. It carries what the round had used so far, so the money can
+ *  be settled at that figure (an unknown figure stays unknown: the caller must not price it as zero). */
+export class RoundCancelled extends Error {
+  constructor(readonly usage: RoundUsage) {
+    super("round cancelled at a checkpoint");
+    this.name = "RoundCancelled";
+  }
+}
 
 export interface RoundUsage {
   tokensIn: number | null;
@@ -77,7 +87,9 @@ export async function runRound(opts: {
   maxAttempts?: number;
   partner?: { family: Family; code: string }; // the CURRENT active tool of the partner pillar (required for command/govern)
   scripted?: { code: string; rationale: string }; // demo-only: a fixed candidate instead of calling the model
+  complete?: Completer; // who answers the proposer; default Forge's own providers (the Veloce host passes its model call)
   emit?: (e: RoundEvent) => void;
+  shouldStop?: () => Promise<boolean>; // asked at checkpoints (not mid-run); true ends the round with RoundCancelled
 }): Promise<RoundResult> {
   const emit = opts.emit ?? (() => {});
   const spec = FAMILIES[opts.family];
@@ -101,6 +113,12 @@ export async function runRound(opts: {
     } else usage.execMs += ms;
   };
 
+  // A checkpoint sits before each costly step (a sandbox run set or a model call). A failure to ask is treated as "keep going":
+  // a cancel is best effort and must never turn into a failed round.
+  const checkpoint = async () => {
+    if (opts.shouldStop && (await opts.shouldStop().catch(() => false))) throw new RoundCancelled({ ...usage });
+  };
+
   let ownSandbox = false;
   let sandboxId = opts.sandboxId;
   try {
@@ -119,6 +137,7 @@ export async function runRound(opts: {
     const blocked = egressBlocked(probe.exitCode, probe.stdout);
     emit({ type: "egress_check", blocked, target: "https://example.com", detail: blocked ? "outbound request failed from inside the sandbox" : "outbound request SUCCEEDED" });
     if (!blocked) throw new Error("egress is not blocked inside the sandbox; refusing to run candidate code");
+    await checkpoint();
 
     // 1) Evaluate the current tool. Visible failures go to the agent; held-out never does.
     const needHeld = !opts.currentHeldoutPass;
@@ -150,9 +169,10 @@ export async function runRound(opts: {
     let prior: { code: string; rejectedBecause: string[] } | undefined;
     let last: RoundResult | undefined;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await checkpoint(); // before the model call and the candidate's sandbox runs
       const p = opts.scripted
         ? { rationale: opts.scripted.rationale, code: opts.scripted.code, tokensIn: 0, tokensOut: 0, model: "scripted-demo" }
-        : await propose({ spec, currentCode: opts.currentCode, failures, priorAttempt: prior });
+        : await propose({ spec, currentCode: opts.currentCode, failures, priorAttempt: prior, complete: opts.complete });
       if (p.tokensIn === null || p.tokensOut === null || usage.tokensIn === null || usage.tokensOut === null) {
         usage.tokensIn = null;
         usage.tokensOut = null;
