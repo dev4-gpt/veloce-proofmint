@@ -419,12 +419,105 @@ test("task.get, task.result and task.cancel check their input and hide unknown t
     assert.deepEqual(await h.call(op, { query: `?id=${body.taskId}&id=${body.taskId}` }), { status: 400, body: { ok: false, error: "invalid_input" } });
     assert.deepEqual(await h.call(op, { query: `?id=${body.taskId}&x=1` }), { status: 400, body: { ok: false, error: "invalid_input" } });
   }
-  // a running round cannot be stopped part way; the answer says so
-  assert.deepEqual(await h.call("task.cancel", { body: { id: body.taskId } }), { status: 200, body: { ok: true, taskId: body.taskId, cancelled: false } });
+  // a running round is asked to stop at its next checkpoint; it has not stopped yet, so `cancelled` stays false
+  assert.deepEqual(await h.call("task.cancel", { body: { id: body.taskId } }), { status: 200, body: { ok: true, taskId: body.taskId, cancelled: false, cancelRequested: true } });
   assert.deepEqual(await h.call("task.cancel", { body: { id: "ft-000000000000000000000000" } }), { status: 404, body: { ok: false, error: "not_found" } });
   assert.deepEqual(await h.call("task.cancel", { body: { id: body.taskId, extra: 1 } }), { status: 400, body: { ok: false, error: "invalid_input" } });
   assert.deepEqual(await h.call("task.cancel", { body: { id: 5 } }), { status: 400, body: { ok: false, error: "invalid_input" } });
   assert.deepEqual(await h.call("task.cancel", { raw: "nope" }), { status: 400, body: { ok: false, error: "invalid_input" } });
+});
+
+// ---------------- best-effort cancel ----------------
+
+test("task.cancel on a running task is recorded, the round sees it at a checkpoint, and the task ends cancelled with one final event", async () => {
+  let stopSeen: boolean | null = null;
+  const h = harness(async (job) => {
+    stopSeen = await job.stop(); // the round's checkpoint, after the host has asked
+    return { status: "cancelled", toolId: null, candidateSha: null, code: null, costMicros: 20_010, visible: null, heldout: null };
+  });
+  const { body } = await h.call("task.run", { body: runBody() });
+  await h.call("task.cancel", { body: { id: body.taskId } });
+  await h.drain();
+  assert.equal(stopSeen, true);
+  const got = await h.call("task.get", { query: `?id=${body.taskId}` });
+  assert.equal(got.body.state, "cancelled");
+  assert.equal(got.body.spentMicros, 20_010);
+  assert.equal((await h.call("task.result", { query: `?id=${body.taskId}` })).status, 409); // a cancelled task has no result
+  const feed = await h.call("events");
+  assert.equal(feed.body.events.length, 1);
+  assert.equal(feed.body.events[0].data.state, "cancelled");
+  // asking again after the end reports the truth
+  assert.deepEqual((await h.call("task.cancel", { body: { id: body.taskId } })).body, { ok: true, taskId: body.taskId, cancelled: true });
+});
+
+test("without a cancel the stop check says no, and a cancel after the round finished changes nothing", async () => {
+  let stopSeen: boolean | null = null;
+  const h = harness(async (job) => {
+    stopSeen = await job.stop();
+    return { status: "proposed", toolId: "t-dates-x", candidateSha: "a".repeat(64), code: "x = 1", costMicros: 20_010, visible: null, heldout: null };
+  });
+  const { body } = await h.call("task.run", { body: runBody() });
+  await h.drain();
+  assert.equal(stopSeen, false);
+  assert.deepEqual((await h.call("task.cancel", { body: { id: body.taskId } })).body, { ok: true, taskId: body.taskId, cancelled: false });
+  assert.equal((await h.call("task.get", { query: `?id=${body.taskId}` })).body.state, "succeeded");
+  assert.equal(await count("h1_tasks", "cancel_requested_at is null"), 1); // nothing was recorded for a finished task
+});
+
+test("a cancelled round is settled at what it used, never as zero when usage is unknown, and released when nothing ran", async () => {
+  const { RoundCancelled } = await import("../src/lib/round");
+  const used = fakePayer();
+  await tryStartRound("r-can00001", "dates", "veloce-host");
+  const out = await executeRound({
+    roundId: "r-can00001", family: "dates", startedBy: "veloce-host", payer: used.payer, send: () => {}, modelsPaidByHost: true,
+    runRoundImpl: async (opts) => { opts.emit?.({ type: "sandbox_created", id: "sb" }); throw new RoundCancelled({ tokensIn: 5, tokensOut: 5, execMs: 100, unknown: false }); },
+  });
+  const sandboxOnly = priceMicros({ tokensIn: 0, tokensOut: 0, execMs: 100 }, { modelsPaidByHost: true });
+  assert.equal(out.status, "cancelled");
+  assert.equal(out.costMicros, sandboxOnly);
+  assert.deepEqual(used.log.filter((l) => l[0] !== "authorize"), [["settle", sandboxOnly, true]]);
+  assert.equal(await count("rounds", "status = 'cancelled'"), 1);
+  const last = (await sql()`select body_json from report_chain order by seq desc limit 1`) as { body_json: string }[];
+  assert.equal(JSON.parse(last[0].body_json).status, "cancelled");
+  assert.equal(JSON.parse(last[0].body_json).settlement, "settled");
+
+  const unknown = fakePayer();
+  await tryStartRound("r-can00002", "dates", "veloce-host");
+  const u = await executeRound({
+    roundId: "r-can00002", family: "dates", startedBy: "veloce-host", payer: unknown.payer, send: () => {}, modelsPaidByHost: true,
+    runRoundImpl: async (opts) => { opts.emit?.({ type: "sandbox_created", id: "sb" }); throw new RoundCancelled({ tokensIn: 0, tokensOut: 0, execMs: null, unknown: true }); },
+  });
+  assert.equal(u.status, "blocked_unsettled"); // unknown usage is never priced as zero
+  assert.equal(u.costMicros, null);
+  assert.ok(unknown.log.some((l) => l[0] === "block"));
+  assert.ok(!unknown.log.some((l) => l[0] === "release"));
+
+  const early = fakePayer();
+  await tryStartRound("r-can00003", "dates", "veloce-host");
+  const e = await executeRound({
+    roundId: "r-can00003", family: "dates", startedBy: "veloce-host", payer: early.payer, send: () => {}, modelsPaidByHost: true,
+    runRoundImpl: async () => { throw new RoundCancelled({ tokensIn: 0, tokensOut: 0, execMs: 0, unknown: false }); }, // no sandbox was created
+  });
+  assert.equal(e.status, "cancelled");
+  assert.equal(e.costMicros, 0);
+  assert.ok(early.log.some((l) => l[0] === "release"));
+  assert.ok(!early.log.some((l) => l[0] === "settle"));
+  assert.equal(await count("rounds", "status = 'running'"), 0);
+});
+
+test("the stop check is handed from the host round to runRound", async () => {
+  const { runHostRound } = await import("../src/lib/roundJob");
+  const { RoundCancelled } = await import("../src/lib/round");
+  const { credit } = await import("../src/lib/db");
+  await credit("test-topup-2", 1_000_000, "made-up credits");
+  await tryStartRound("r-can00004", "dates", "veloce-host");
+  let handed: unknown = null;
+  const out = await runHostRound({
+    roundId: "r-can00004", family: "dates", complete: async () => { throw new Error("not called"); }, stop: async () => true,
+    runRoundImpl: async (opts) => { handed = opts.shouldStop; throw new RoundCancelled({ tokensIn: 0, tokensOut: 0, execMs: 0, unknown: false }); },
+  });
+  assert.equal(typeof handed, "function");
+  assert.equal(out.status, "cancelled");
 });
 
 test("the events feed checks after and limit, pages in order, and says when more is waiting", async () => {

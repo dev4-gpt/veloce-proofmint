@@ -61,6 +61,8 @@ export async function ensureSchema() {
   await q`create table if not exists h1_used_tokens (jti text primary key, exp bigint not null)`;
   // What a finished h1 task charged Forge's wallet, reported to the host so it can settle the budget it set aside (Veloce ADR-020).
   await q`alter table h1_tasks add column if not exists spent_micros bigint`;
+  // The host asked this task to stop (task.cancel). The round reads it at its checkpoints; it is never a state by itself.
+  await q`alter table h1_tasks add column if not exists cancel_requested_at timestamptz`;
   await q`create table if not exists card_holds (round_id text primary key, payment_intent text unique, amount_cents int not null, status text not null check (status in ('authorizing','authorized','capturing','captured','releasing','released','failed','unresolved')), captured_cents int, note text, created_at timestamptz not null default now(), updated_at timestamptz not null default now())`;
   schemaReady = true;
 }

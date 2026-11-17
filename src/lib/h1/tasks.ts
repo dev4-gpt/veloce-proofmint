@@ -26,7 +26,8 @@ const FAILED_CODES = new Set(["blocked_unsettled", "refused"]);
 const SUCCEEDED = new Set(["proposed", "rejected"]);
 const STARTED_BY = "veloce-host";
 
-export type RoundRunner = (job: { roundId: string; family: Family; complete: Completer }) => Promise<RoundOutcome>;
+/** `stop` answers whether the host asked this task to cancel; the round reads it at its checkpoints (round.ts). */
+export type RoundRunner = (job: { roundId: string; family: Family; complete: Completer; stop: () => Promise<boolean> }) => Promise<RoundOutcome>;
 export interface H1Deps {
   config: H1Config;
   /** Runs work after the reply has been sent (Vercel/Next `after`). */
@@ -105,15 +106,17 @@ async function getTask(taskId: string): Promise<TaskRow | null> {
 }
 
 /** Compare-and-set from running: a task already recorded as failed (timed out) is never overwritten. */
-async function finishTask(taskId: string, state: "succeeded" | "failed", result: Json | null, error: string | null, spent: number): Promise<void> {
+async function finishTask(taskId: string, state: "succeeded" | "failed" | "cancelled", result: Json | null, error: string | null, spent: number): Promise<void> {
   const rows = (await sql()`update h1_tasks set state = ${state}, result_json = ${result ? JSON.stringify(result) : null}, error = ${error}, spent_micros = ${spent}, finished_at = now() where task_id = ${taskId} and state = 'running' returning *`) as TaskRow[];
   if (rows[0]) await appendFinal(rows[0]);
 }
 
 async function runTask(taskId: string, roundId: string, family: Family, complete: Completer, run: RoundRunner): Promise<void> {
   let outcome: RoundOutcome | null = null;
+  // Read from the database, not memory: the cancel may arrive on another instance of this function.
+  const stop = async () => ((await sql()`select 1 from h1_tasks where task_id = ${taskId} and cancel_requested_at is not null`) as unknown[]).length > 0;
   try {
-    outcome = await run({ roundId, family, complete });
+    outcome = await run({ roundId, family, complete, stop });
   } catch {
     outcome = null; // the cause is not recorded: it may hold text from a provider
   }
@@ -126,6 +129,7 @@ async function runTask(taskId: string, roundId: string, family: Family, complete
     };
     return finishTask(taskId, "succeeded", result, null, spentOf(outcome));
   }
+  if (outcome?.status === "cancelled") return finishTask(taskId, "cancelled", null, null, spentOf(outcome));
   const error = outcome && FAILED_CODES.has(outcome.status) ? outcome.status : "round_error";
   return finishTask(taskId, "failed", null, error, spentOf(outcome));
 }
@@ -211,11 +215,18 @@ async function taskResult(url: URL): Promise<Response> {
   return send(200, { ok: true, taskId: row.task_id, ...(JSON.parse(row.result_json) as Json) });
 }
 
-/** A round cannot be stopped part way (the sandbox and the money are already committed), so a cancel is answered, never applied. */
+/** Best effort. A round stops only at its checkpoints (before the model call and before each sandbox run set), never mid-run, so
+ *  a request is recorded and answered with `cancelRequested`; `cancelled` is true only once the task has actually ended as
+ *  cancelled. A request that arrives after the last checkpoint changes nothing and the task finishes as the round decided. */
 async function taskCancel(body: unknown): Promise<Response> {
   if (!isObject(body) || !onlyKeys(body, ["id"]) || typeof body.id !== "string") return fail(400, "invalid_input");
-  if (!TASK_ID.test(body.id) || !(await getTask(body.id))) return fail(404, "not_found");
-  return send(200, { ok: true, taskId: body.id, cancelled: false });
+  if (!TASK_ID.test(body.id)) return fail(404, "not_found");
+  await sweepStale();
+  const row = await getTask(body.id);
+  if (!row) return fail(404, "not_found");
+  if (row.state !== "running") return send(200, { ok: true, taskId: body.id, cancelled: row.state === "cancelled" });
+  await sql()`update h1_tasks set cancel_requested_at = coalesce(cancel_requested_at, now()) where task_id = ${body.id} and state = 'running'`;
+  return send(200, { ok: true, taskId: body.id, cancelled: false, cancelRequested: true });
 }
 
 /** A whole number inside [min, max], or null. Nothing is clamped silently. */

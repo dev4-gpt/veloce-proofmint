@@ -13,7 +13,7 @@ import { priceMicros, ROUND_CAP_MICROS } from "./cost";
 import { finishRoundRow, getActive, getHeldoutSet, insertTool, nextVersion, setActiveHeldout } from "./db";
 import type { Completer } from "./llm";
 import { capturePolicy, isBillable, walletPayer, type Payer } from "./payer";
-import { runRound, type RoundEvent, type RoundUsage } from "./round";
+import { RoundCancelled, runRound, type RoundEvent, type RoundUsage } from "./round";
 
 export interface RoundJobInput {
   roundId: string;
@@ -25,6 +25,7 @@ export interface RoundJobInput {
   simulateMissingUsage?: boolean; // demo only (page): proves that unknown usage is never settled as zero
   complete?: Completer; // who answers the proposer; default Forge's own providers
   modelsPaidByHost?: boolean;
+  stop?: () => Promise<boolean>; // the host asked for a cancel; read at the round's checkpoints
   runRoundImpl?: typeof runRound; // tests only
 }
 
@@ -125,6 +126,7 @@ export async function executeRound(input: RoundJobInput): Promise<RoundOutcome> 
       maxAttempts: input.cheat ? 1 : 2,
       complete: input.complete,
       emit: send,
+      shouldStop: input.stop,
     });
 
     // Remember the current tool's held-out standing the first time we measure it.
@@ -166,6 +168,34 @@ export async function executeRound(input: RoundJobInput): Promise<RoundOutcome> 
     await finishRoundRow(roundId, status, result.usage);
     return { status, toolId, candidateSha, code: result.candidate?.code ?? null, costMicros, visible: result.visible, heldout: result.heldout };
   } catch (e) {
+    if (e instanceof RoundCancelled && reserved && !settledOrBlocked) {
+      // The host asked the round to stop at a checkpoint. Settle at what was used, never as zero when that is unknown (I2),
+      // and keep a failed settlement a blocked round (I3). Nothing was stored as a tool: a cancelled round proposes nothing.
+      let status = "cancelled";
+      if (!sandboxStarted) {
+        await payer.releaseUnused().catch(() => {}); // nothing ran: usage is known to be zero
+        settlement = "released";
+        costMicros = 0;
+        send({ type: "released", reason: "round cancelled before any sandbox ran; nothing was used" });
+      } else {
+        const actual = roundCost(e.usage, input);
+        const settled = actual === null ? null : await payer.settle(actual, true).catch(() => null);
+        if (settled && settled.kind === "settled") {
+          settlement = "settled";
+          costMicros = settled.costMicros;
+          send({ type: "settled", actualMicros: settled.costMicros, releasedMicros: settled.releasedMicros, mode: payer.mode, waived: settled.waived === true });
+        } else {
+          await payer.block("round cancelled; usage unknown or settlement failed").catch(() => {});
+          status = "blocked_unsettled";
+          send({ type: "blocked_unsettled", reason: "round cancelled; usage unknown or settlement failed; reservation stays held" });
+        }
+      }
+      settledOrBlocked = true;
+      send({ type: "cancelled", usage: { tokensIn: e.usage.tokensIn, tokensOut: e.usage.tokensOut, execMs: e.usage.execMs } });
+      await record({ status, costMicros, usage: { tokensIn: e.usage.tokensIn, tokensOut: e.usage.tokensOut, execMs: e.usage.execMs } });
+      await finishRoundRow(roundId, status, e.usage);
+      return none(status, costMicros);
+    }
     const message = e instanceof Error ? e.message : String(e);
     // A failed round must never look free: keep the hold and say why in the ledger.
     if (reserved && !settledOrBlocked) {
@@ -187,9 +217,9 @@ export async function executeRound(input: RoundJobInput): Promise<RoundOutcome> 
 }
 
 /** A round the Veloce host started (h1 `proofmint.round`): paid from Forge's wallet for sandbox time and the fee only. */
-export async function runHostRound(job: { roundId: string; family: Family; complete: Completer; runRoundImpl?: typeof runRound }): Promise<RoundOutcome> {
+export async function runHostRound(job: { roundId: string; family: Family; complete: Completer; stop?: () => Promise<boolean>; runRoundImpl?: typeof runRound }): Promise<RoundOutcome> {
   return executeRound({
     roundId: job.roundId, family: job.family, startedBy: "veloce-host", payer: walletPayer(job.roundId, ROUND_CAP_MICROS),
-    send: () => {}, complete: job.complete, modelsPaidByHost: true, runRoundImpl: job.runRoundImpl,
+    send: () => {}, complete: job.complete, modelsPaidByHost: true, stop: job.stop, runRoundImpl: job.runRoundImpl,
   });
 }
