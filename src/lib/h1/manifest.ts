@@ -3,7 +3,8 @@
 //
 // One task, `proofmint.round`, draft class: it proposes a better tool version; promotion still needs Forge's own hash-bound human
 // approval, so nothing here can publish. Deletion guarantee "none": Forge keeps no host memory and offers no deletion receipts,
-// which keeps it out of a client edition until it does (Veloce ADR-014).
+// and holds no tenant-supplied data, as stated in deletionScope. Owner-approved option A (Veloce ADR-020,
+// 2026-11-16) permits client-edition admission under ADR-011/ADR-014; this is not a deletion guarantee or activation.
 import { createPublicKey, type KeyObject } from "node:crypto";
 import { isHostProvider, validHostUrl, validModelName, type HostProvider } from "../veloceModel";
 
@@ -23,6 +24,7 @@ export interface H1Manifest {
   tasks: readonly { name: string; sideEffect: "read" | "draft" | "publish" }[];
   sideEffectCeiling: "read" | "draft" | "publish";
   deletionGuarantee: "none" | "host-owned" | "receipt";
+  deletionScope?: string;
 }
 
 export const MANIFEST: H1Manifest = Object.freeze({
@@ -36,6 +38,7 @@ export const MANIFEST: H1Manifest = Object.freeze({
   tasks: Object.freeze([Object.freeze({ name: FORGE_TASK, sideEffect: "draft" as const })]),
   sideEffectCeiling: "draft",
   deletionGuarantee: "none",
+  deletionScope: "Holds no tenant-supplied data: tasks accept a fixed public benchmark family and an in-memory model grant, not client text. Retained tasks, events, tools and reports derive from public benchmark cases and model-generated code. No memory is proposed and no deletion receipts are offered. Client-edition admission follows the owner-approved ADR-020 option A exception; activation still requires host approval.",
 });
 
 export interface H1Config {
